@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 
 import numpy as np
 import torch
@@ -97,6 +98,63 @@ class Core(nn.Module):
             raise ValueError(f"Invalid mode '{mode}'. Use: {list(table.keys())}")
         return table[mode]
 
+    def count_params(self) -> dict[str, int]:
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return {"total": total, "trainable": trainable}
+
+    def summary(self):
+        params = self.count_params()
+        total, trainable = params["total"], params["trainable"]
+        frozen = total - trainable
+        device = next(self.parameters()).device
+
+        rows = []
+        rows.append(f"Model: {self.model_name}")
+        rows.append(f"Device: {device}")
+        rows.append(f"Params: {total:,} total, {trainable:,} trainable, {frozen:,} frozen")
+
+        trainable_modules = {}
+        for name, module in self.named_modules():
+            if list(module.children()):
+                continue
+            n = sum(p.numel() for p in module.parameters())
+            if n > 0:
+                trainable_modules[name or type(module).__name__] = n
+
+        if trainable_modules:
+            rows.append("")
+            rows.append(f"{'Layer':<40} {'Params':>12}")
+            rows.append("-" * 52)
+            for name, n in sorted(trainable_modules.items(), key=lambda x: -x[1]):
+                rows.append(f"{name:<40} {n:>12,}")
+
+        msg = "\n".join(rows)
+        self._log("info", msg)
+        return params
+
+    def freeze(self, layers: list[str] | None = None):
+        if layers is None:
+            for p in self.parameters():
+                p.requires_grad = False
+            self._log("info", "Froze all parameters")
+        else:
+            for name, param in self.named_parameters():
+                if any(name.startswith(l) for l in layers):
+                    param.requires_grad = False
+            self._log("info", f"Froze layers matching: {layers}")
+
+    def unfreeze(self, layers: list[str] | None = None):
+        if layers is None:
+            for p in self.parameters():
+                p.requires_grad = True
+            self._log("info", "Unfroze all parameters")
+        else:
+            for name, param in self.named_parameters():
+                if any(name.startswith(l) for l in layers):
+                    param.requires_grad = True
+            self._log("info", f"Unfroze layers matching: {layers}")
+
     # ── Training ─────────────────────────────────────────────
 
     def fit(
@@ -107,6 +165,7 @@ class Core(nn.Module):
         model_save_dir: str = "./checkpoints/",
         patience: int = 15,
         delta: float = 0.01,
+        min_delta: float = 0.0,
         save_interval: int = 1,
         grad_clip: float | None = 1.0,
     ):
@@ -118,12 +177,16 @@ class Core(nn.Module):
         total_epochs = start_epoch + num_epochs
 
         self._log("info", f"Training epoch {start_epoch + 1} -> {total_epochs}")
+        self.summary()
+
+        t_start = time.time()
 
         for epoch in range(start_epoch + 1, total_epochs + 1):
             self.last_epoch = epoch
             self._log("info", f"\nEpoch {epoch}/{total_epochs}")
             self.train()
             running_loss = 0.0
+            t_epoch = time.time()
 
             for batch in tqdm(train_loader, desc="Training", leave=False):
                 inputs, targets = batch[0].to(device), batch[1].to(device)
@@ -142,29 +205,44 @@ class Core(nn.Module):
                 running_loss += loss.item()
 
             epoch_loss = running_loss / len(train_loader)
-            self._log("info", f"Train Loss: {epoch_loss:.4f}")
+            epoch_time = time.time() - t_epoch
+            self._log("info", f"Train Loss: {epoch_loss:.4f} | Time: {epoch_time:.1f}s")
 
             if self.scheduler is not None:
-                self.scheduler.step()
-                self._log("info", f"LR: {self.scheduler.get_last_lr()[0]:.6f}")
+                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    pass
+                else:
+                    self.scheduler.step()
+                    self._log("info", f"LR: {self.scheduler.get_last_lr()[0]:.6f}")
 
             if save_interval > 0 and epoch % save_interval == 0:
                 self.save(model_dir=model_save_dir, mode="latest")
 
             val_loss, val_metrics = self.evaluate(val_loader, verbose=True)
 
-            if self.best_loss is None or val_loss < self.best_loss - delta:
+            if self.best_loss is None or val_loss < self.best_loss - min_delta:
                 self.best_loss = val_loss
                 self.save(model_dir=model_save_dir, mode="best")
                 self._log("info", f"New best model: val_loss={self.best_loss:.4f}")
+
+            if self.scheduler is not None and isinstance(
+                self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau
+            ):
+                self.scheduler.step(val_loss)
+                self._log("info", f"LR: {self.scheduler.get_last_lr()[0]:.6f}")
 
             early_stopping(val_loss)
             if early_stopping.early_stop:
                 self._log("info", "Early stopping triggered")
                 break
 
+        total_time = time.time() - t_start
         self.load(model_dir=model_save_dir, mode="best")
-        self._log("info", f"Training complete. Best val_loss: {self.best_loss:.4f}")
+        self._log(
+            "info",
+            f"Training complete. Best val_loss: {self.best_loss:.4f} | "
+            f"Total time: {total_time / 60:.1f}min",
+        )
 
     # ── Evaluation ───────────────────────────────────────────
 
@@ -202,6 +280,11 @@ class Core(nn.Module):
     def predict(self, *args, **kwargs):
         device = next(self.parameters()).device
         self.eval()
+        args = tuple(a.to(device) if isinstance(a, torch.Tensor) else a for a in args)
+        kwargs = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in kwargs.items()
+        }
         return self(*args, **kwargs)
 
     # ── Save / Load / Transfer ───────────────────────────────
