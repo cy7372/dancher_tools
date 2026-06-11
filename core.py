@@ -14,7 +14,7 @@ class Core(nn.Module):
         super().__init__()
         self.model_name: str | None = None
         self.last_epoch: int = 0
-        self.best_val: float | None = None
+        self.best_loss: float | None = None
         self.optimizer: torch.optim.Optimizer | None = None
         self.scheduler = None
         self.criterion: nn.Module | None = None
@@ -109,7 +109,6 @@ class Core(nn.Module):
         delta: float = 0.01,
         save_interval: int = 1,
         grad_clip: float | None = 1.0,
-        higher_is_better: bool = True,
     ):
         self._setup_logger(model_save_dir)
 
@@ -117,7 +116,6 @@ class Core(nn.Module):
         device = next(self.parameters()).device
         start_epoch = getattr(self, "last_epoch", 0)
         total_epochs = start_epoch + num_epochs
-        first_metric = list(self.metrics.keys())[0] if self.metrics else None
 
         self._log("info", f"Training epoch {start_epoch + 1} -> {total_epochs}")
 
@@ -154,21 +152,11 @@ class Core(nn.Module):
                 self.save(model_dir=model_save_dir, mode="latest")
 
             val_loss, val_metrics = self.evaluate(val_loader, verbose=True)
-            val_score = val_metrics.get(first_metric) if first_metric else None
 
-            if val_score is not None:
-                if self.best_val is None:
-                    improved = True
-                elif higher_is_better:
-                    improved = val_score > self.best_val
-                else:
-                    improved = val_score < self.best_val
-                if improved:
-                    self.best_val = val_score
-                    self.save(model_dir=model_save_dir, mode="best")
-                    self._log(
-                        "info", f"New best model: {first_metric}={self.best_val:.4f}"
-                    )
+            if self.best_loss is None or val_loss < self.best_loss - delta:
+                self.best_loss = val_loss
+                self.save(model_dir=model_save_dir, mode="best")
+                self._log("info", f"New best model: val_loss={self.best_loss:.4f}")
 
             early_stopping(val_loss)
             if early_stopping.early_stop:
@@ -176,7 +164,7 @@ class Core(nn.Module):
                 break
 
         self.load(model_dir=model_save_dir, mode="best")
-        self._log("info", f"Training complete. Best {first_metric}: {self.best_val:.4f}")
+        self._log("info", f"Training complete. Best val_loss: {self.best_loss:.4f}")
 
     # ── Evaluation ───────────────────────────────────────────
 
@@ -225,7 +213,7 @@ class Core(nn.Module):
         save_dict = {
             "epoch": self.last_epoch,
             "model_state_dict": self.state_dict(),
-            "best_val": self.best_val,
+            "best_val": self.best_loss,
         }
         if self.optimizer is not None:
             save_dict["optimizer_state_dict"] = self.optimizer.state_dict()
@@ -249,13 +237,13 @@ class Core(nn.Module):
         if not os.path.exists(load_path):
             self._log("info", f"No checkpoint at {load_path}, starting from scratch")
             self.last_epoch = 0
-            self.best_val = None
+            self.best_loss = None
             return
 
         checkpoint = torch.load(load_path, weights_only=False)
         self.load_state_dict(checkpoint["model_state_dict"])
         self.last_epoch = checkpoint.get("epoch", 0)
-        self.best_val = checkpoint.get("best_val", None)
+        self.best_loss = checkpoint.get("best_val", None)
 
         if self.optimizer is not None and "optimizer_state_dict" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -264,7 +252,7 @@ class Core(nn.Module):
 
         self._log(
             "info",
-            f"Loaded from {load_path}, epoch={self.last_epoch}, best_val={self.best_val}",
+            f"Loaded from {load_path}, epoch={self.last_epoch}, best_loss={self.best_loss}",
         )
 
     def transfer(self, specified_path: str, strict: bool = False):
