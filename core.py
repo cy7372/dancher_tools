@@ -14,20 +14,24 @@ class Core(nn.Module):
         super().__init__()
         self.model_name: str | None = None
         self.last_epoch: int = 0
-        self.best_val: float = 0
+        self.best_val: float | None = None
         self.optimizer: torch.optim.Optimizer | None = None
+        self.scheduler = None
         self.criterion: nn.Module | None = None
         self.metrics: dict = {}
         self._logger: logging.Logger | None = None
+        self._log_dir: str | None = None
 
     def compile(
         self,
         criterion: nn.Module | list[nn.Module],
         optimizer: torch.optim.Optimizer | None = None,
+        scheduler=None,
         metrics: dict[str, callable] | None = None,
         loss_weights: list[float] | None = None,
     ):
         self.optimizer = optimizer
+        self.scheduler = scheduler
 
         if isinstance(criterion, list):
             match len(criterion):
@@ -54,6 +58,9 @@ class Core(nn.Module):
     # ── Logging ──────────────────────────────────────────────
 
     def _setup_logger(self, log_dir: str):
+        if self._logger is not None and self._log_dir == log_dir:
+            return
+
         self._logger = logging.getLogger(f"dancher.{id(self)}")
         self._logger.setLevel(logging.INFO)
         self._logger.handlers.clear()
@@ -65,15 +72,30 @@ class Core(nn.Module):
         self._logger.addHandler(console)
 
         os.makedirs(log_dir, exist_ok=True)
-        file_handler = logging.FileHandler(os.path.join(log_dir, "training.log"), encoding="utf-8")
+        file_handler = logging.FileHandler(
+            os.path.join(log_dir, "training.log"), encoding="utf-8"
+        )
         file_handler.setFormatter(fmt)
         self._logger.addHandler(file_handler)
+        self._log_dir = log_dir
 
     def _log(self, level: str, msg: str):
         if self._logger is not None:
             getattr(self._logger, level)(msg)
         else:
             print(msg)
+
+    # ── Helpers ──────────────────────────────────────────────
+
+    def _filename(self, mode: str) -> str:
+        table = {
+            "latest": f"{self.model_name}_latest.pth",
+            "best": f"{self.model_name}_best.pth",
+            "epoch": f"{self.model_name}_epoch_{self.last_epoch}.pth",
+        }
+        if mode not in table:
+            raise ValueError(f"Invalid mode '{mode}'. Use: {list(table.keys())}")
+        return table[mode]
 
     # ── Training ─────────────────────────────────────────────
 
@@ -93,12 +115,15 @@ class Core(nn.Module):
 
         early_stopping = EarlyStopping(patience=patience, delta=delta)
         device = next(self.parameters()).device
-        current_epoch = getattr(self, "last_epoch", 0)
+        start_epoch = getattr(self, "last_epoch", 0)
+        total_epochs = start_epoch + num_epochs
         first_metric = list(self.metrics.keys())[0] if self.metrics else None
 
-        for epoch in range(current_epoch + 1, current_epoch + num_epochs + 1):
+        self._log("info", f"Training epoch {start_epoch + 1} -> {total_epochs}")
+
+        for epoch in range(start_epoch + 1, total_epochs + 1):
             self.last_epoch = epoch
-            self._log("info", f"\nEpoch {epoch}/{current_epoch + num_epochs}")
+            self._log("info", f"\nEpoch {epoch}/{total_epochs}")
             self.train()
             running_loss = 0.0
 
@@ -111,7 +136,9 @@ class Core(nn.Module):
                 loss.backward()
 
                 if grad_clip is not None:
-                    torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=grad_clip)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.parameters(), max_norm=grad_clip
+                    )
                 self.optimizer.step()
 
                 running_loss += loss.item()
@@ -119,18 +146,29 @@ class Core(nn.Module):
             epoch_loss = running_loss / len(train_loader)
             self._log("info", f"Train Loss: {epoch_loss:.4f}")
 
+            if self.scheduler is not None:
+                self.scheduler.step()
+                self._log("info", f"LR: {self.scheduler.get_last_lr()[0]:.6f}")
+
             if save_interval > 0 and epoch % save_interval == 0:
                 self.save(model_dir=model_save_dir, mode="latest")
 
-            val_loss, val_metrics = self.evaluate(val_loader)
+            val_loss, val_metrics = self.evaluate(val_loader, verbose=True)
             val_score = val_metrics.get(first_metric) if first_metric else None
 
             if val_score is not None:
-                improved = val_score > self.best_val if higher_is_better else val_score < self.best_val
-                if improved or self.best_val == 0:
+                if self.best_val is None:
+                    improved = True
+                elif higher_is_better:
+                    improved = val_score > self.best_val
+                else:
+                    improved = val_score < self.best_val
+                if improved:
                     self.best_val = val_score
                     self.save(model_dir=model_save_dir, mode="best")
-                    self._log("info", f"New best model: {first_metric}={self.best_val:.4f}")
+                    self._log(
+                        "info", f"New best model: {first_metric}={self.best_val:.4f}"
+                    )
 
             early_stopping(val_loss)
             if early_stopping.early_stop:
@@ -142,7 +180,9 @@ class Core(nn.Module):
 
     # ── Evaluation ───────────────────────────────────────────
 
-    def evaluate(self, data_loader) -> tuple[float, dict[str, float]]:
+    def evaluate(
+        self, data_loader, verbose: bool = False
+    ) -> tuple[float, dict[str, float]]:
         device = next(self.parameters()).device
         self.eval()
         total_loss = 0.0
@@ -160,30 +200,37 @@ class Core(nn.Module):
                     metric_results[name].append(fn(outputs, targets))
 
         avg_loss = total_loss / len(data_loader)
-        avg_metrics = {name: round(float(np.mean(vals)), 4) for name, vals in metric_results.items()}
+        avg_metrics = {
+            name: round(float(np.mean(vals)), 4) for name, vals in metric_results.items()
+        }
 
-        self._log("info", f"Val Loss: {avg_loss:.4f} | Metrics: {avg_metrics}")
+        if verbose:
+            self._log("info", f"Val Loss: {avg_loss:.4f} | Metrics: {avg_metrics}")
         return avg_loss, avg_metrics
+
+    # ── Predict ──────────────────────────────────────────────
+
+    @torch.no_grad()
+    def predict(self, *args, **kwargs):
+        device = next(self.parameters()).device
+        self.eval()
+        return self(*args, **kwargs)
 
     # ── Save / Load / Transfer ───────────────────────────────
 
     def save(self, model_dir: str = "./checkpoints", mode: str = "latest"):
         os.makedirs(model_dir, exist_ok=True)
 
-        filenames = {
-            "latest": f"{self.model_name}_latest.pth",
-            "best": f"{self.model_name}_best.pth",
-            "epoch": f"{self.model_name}_epoch_{self.last_epoch}.pth",
-        }
-        if mode not in filenames:
-            raise ValueError(f"Invalid mode '{mode}'. Use: {list(filenames.keys())}")
-
-        save_path = os.path.join(model_dir, filenames[mode])
+        save_path = os.path.join(model_dir, self._filename(mode))
         save_dict = {
             "epoch": self.last_epoch,
             "model_state_dict": self.state_dict(),
             "best_val": self.best_val,
         }
+        if self.optimizer is not None:
+            save_dict["optimizer_state_dict"] = self.optimizer.state_dict()
+        if self.scheduler is not None:
+            save_dict["scheduler_state_dict"] = self.scheduler.state_dict()
 
         try:
             torch.save(save_dict, save_path, pickle_protocol=4)
@@ -191,29 +238,34 @@ class Core(nn.Module):
         except Exception as e:
             self._log("error", f"Failed to save: {e}")
 
-    def load(self, model_dir: str = "./checkpoints", mode: str = "latest", specified_path: str | None = None):
-        if specified_path:
-            load_path = specified_path
-        else:
-            filenames = {
-                "latest": f"{self.model_name}_latest.pth",
-                "best": f"{self.model_name}_best.pth",
-                "epoch": f"{self.model_name}_epoch_{self.last_epoch}.pth",
-            }
-            if mode not in filenames:
-                raise ValueError(f"Invalid mode '{mode}'. Use: {list(filenames.keys())}")
-            load_path = os.path.join(model_dir, filenames[mode])
+    def load(
+        self,
+        model_dir: str = "./checkpoints",
+        mode: str = "latest",
+        specified_path: str | None = None,
+    ):
+        load_path = specified_path or os.path.join(model_dir, self._filename(mode))
 
-        if os.path.exists(load_path):
-            checkpoint = torch.load(load_path, weights_only=False)
-            self.load_state_dict(checkpoint["model_state_dict"])
-            self.last_epoch = checkpoint.get("epoch", 0)
-            self.best_val = checkpoint.get("best_val", 0)
-            self._log("info", f"Loaded from {load_path}, epoch={self.last_epoch}, best_val={self.best_val}")
-        else:
+        if not os.path.exists(load_path):
             self._log("info", f"No checkpoint at {load_path}, starting from scratch")
             self.last_epoch = 0
-            self.best_val = 0
+            self.best_val = None
+            return
+
+        checkpoint = torch.load(load_path, weights_only=False)
+        self.load_state_dict(checkpoint["model_state_dict"])
+        self.last_epoch = checkpoint.get("epoch", 0)
+        self.best_val = checkpoint.get("best_val", None)
+
+        if self.optimizer is not None and "optimizer_state_dict" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+        self._log(
+            "info",
+            f"Loaded from {load_path}, epoch={self.last_epoch}, best_val={self.best_val}",
+        )
 
     def transfer(self, specified_path: str, strict: bool = False):
         if not specified_path:
@@ -242,7 +294,8 @@ class Core(nn.Module):
         self.load_state_dict(new_state, strict=False)
         self._log(
             "info",
-            f"Transfer: {len(new_state)} matched, {len(missing)} missing, {len(size_mismatch)} size mismatch",
+            f"Transfer: {len(new_state)} matched, {len(missing)} missing, "
+            f"{len(size_mismatch)} size mismatch",
         )
         if missing:
             self._log("info", f"Missing: {missing}")
