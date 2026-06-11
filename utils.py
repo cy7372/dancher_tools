@@ -21,6 +21,10 @@ class EarlyStopping:
             self.best_loss = val_loss
             self.counter = 0
 
+    @property
+    def status(self) -> str:
+        return f"{self.counter}/{self.patience}"
+
 
 class CombinedLoss(nn.Module):
     def __init__(self, losses: list, weights: list | None = None):

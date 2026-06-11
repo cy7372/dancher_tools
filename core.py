@@ -1,4 +1,6 @@
+import csv
 import os
+import tempfile
 import logging
 import time
 
@@ -22,6 +24,10 @@ class Core(nn.Module):
         self.metrics: dict = {}
         self._logger: logging.Logger | None = None
         self._log_dir: str | None = None
+
+    @property
+    def device(self) -> torch.device:
+        return next(self.parameters()).device
 
     def compile(
         self,
@@ -86,33 +92,53 @@ class Core(nn.Module):
         else:
             print(msg)
 
+    # ── CSV log ──────────────────────────────────────────────
+
+    def _csv_path(self, save_dir: str) -> str:
+        return os.path.join(save_dir, "training_log.csv")
+
+    def _write_csv_header(self, save_dir: str):
+        header = ["epoch", "train_loss", "val_loss", "lr", "time"]
+        header.extend(self.metrics.keys())
+        with open(self._csv_path(save_dir), "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+
+    def _append_csv_row(self, save_dir: str, row: list):
+        with open(self._csv_path(save_dir), "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+
     # ── Helpers ──────────────────────────────────────────────
 
     def _filename(self, mode: str) -> str:
         table = {
             "latest": f"{self.model_name}_latest.pth",
             "best": f"{self.model_name}_best.pth",
-            "epoch": f"{self.model_name}_epoch_{self.last_epoch}.pth",
         }
         if mode not in table:
             raise ValueError(f"Invalid mode '{mode}'. Use: {list(table.keys())}")
         return table[mode]
+
+    def _weights_filename(self) -> str:
+        return f"{self.model_name}_weights.pth"
 
     def count_params(self) -> dict[str, int]:
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return {"total": total, "trainable": trainable}
 
-    def summary(self):
+    def summary(self, max_layers: int = 20):
         params = self.count_params()
         total, trainable = params["total"], params["trainable"]
         frozen = total - trainable
-        device = next(self.parameters()).device
+        dev = self.device
 
-        rows = []
-        rows.append(f"Model: {self.model_name}")
-        rows.append(f"Device: {device}")
-        rows.append(f"Params: {total:,} total, {trainable:,} trainable, {frozen:,} frozen")
+        rows = [
+            f"Model: {self.model_name}",
+            f"Device: {dev}",
+            f"Params: {total:,} total, {trainable:,} trainable, {frozen:,} frozen",
+        ]
 
         trainable_modules = {}
         for name, module in self.named_modules():
@@ -126,8 +152,11 @@ class Core(nn.Module):
             rows.append("")
             rows.append(f"{'Layer':<40} {'Params':>12}")
             rows.append("-" * 52)
-            for name, n in sorted(trainable_modules.items(), key=lambda x: -x[1]):
+            sorted_modules = sorted(trainable_modules.items(), key=lambda x: -x[1])
+            for name, n in sorted_modules[:max_layers]:
                 rows.append(f"{name:<40} {n:>12,}")
+            if len(sorted_modules) > max_layers:
+                rows.append(f"... and {len(sorted_modules) - max_layers} more layers")
 
         msg = "\n".join(rows)
         self._log("info", msg)
@@ -155,6 +184,36 @@ class Core(nn.Module):
                     param.requires_grad = True
             self._log("info", f"Unfroze layers matching: {layers}")
 
+    # ── Training hooks (override for custom training steps) ───
+
+    def _training_step(self, batch) -> torch.Tensor:
+        inputs, targets = batch[0].to(self.device), batch[1].to(self.device)
+        outputs = self(inputs)
+        return self.criterion(outputs, targets)
+
+    def _eval_step(self, batch) -> tuple[torch.Tensor, dict[str, float]]:
+        inputs, targets = batch[0].to(self.device), batch[1].to(self.device)
+        outputs = self(inputs)
+        loss = self.criterion(outputs, targets)
+        step_metrics = {name: fn(outputs, targets) for name, fn in self.metrics.items()}
+        return loss, step_metrics
+
+    def _step_scheduler(self, val_loss: float | None = None):
+        if self.scheduler is None:
+            return
+        if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            if val_loss is not None:
+                self.scheduler.step(val_loss)
+        else:
+            self.scheduler.step()
+
+    def _current_lr(self) -> float:
+        if self.scheduler is not None:
+            return self.scheduler.get_last_lr()[0]
+        if self.optimizer is not None:
+            return self.optimizer.param_groups[0]["lr"]
+        return 0.0
+
     # ── Training ─────────────────────────────────────────────
 
     def fit(
@@ -170,9 +229,9 @@ class Core(nn.Module):
         grad_clip: float | None = 1.0,
     ):
         self._setup_logger(model_save_dir)
+        self._write_csv_header(model_save_dir)
 
         early_stopping = EarlyStopping(patience=patience, delta=delta)
-        device = next(self.parameters()).device
         start_epoch = getattr(self, "last_epoch", 0)
         total_epochs = start_epoch + num_epochs
 
@@ -189,11 +248,8 @@ class Core(nn.Module):
             t_epoch = time.time()
 
             for batch in tqdm(train_loader, desc="Training", leave=False):
-                inputs, targets = batch[0].to(device), batch[1].to(device)
-
                 self.optimizer.zero_grad()
-                outputs = self(inputs)
-                loss = self.criterion(outputs, targets)
+                loss = self._training_step(batch)
                 loss.backward()
 
                 if grad_clip is not None:
@@ -206,14 +262,12 @@ class Core(nn.Module):
 
             epoch_loss = running_loss / len(train_loader)
             epoch_time = time.time() - t_epoch
-            self._log("info", f"Train Loss: {epoch_loss:.4f} | Time: {epoch_time:.1f}s")
+            lr = self._current_lr()
 
-            if self.scheduler is not None:
-                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    pass
-                else:
-                    self.scheduler.step()
-                    self._log("info", f"LR: {self.scheduler.get_last_lr()[0]:.6f}")
+            self._log(
+                "info",
+                f"Train Loss: {epoch_loss:.4f} | LR: {lr:.8f} | Time: {epoch_time:.1f}s",
+            )
 
             if save_interval > 0 and epoch % save_interval == 0:
                 self.save(model_dir=model_save_dir, mode="latest")
@@ -223,17 +277,23 @@ class Core(nn.Module):
             if self.best_loss is None or val_loss < self.best_loss - min_delta:
                 self.best_loss = val_loss
                 self.save(model_dir=model_save_dir, mode="best")
+                self._save_weights(model_save_dir)
                 self._log("info", f"New best model: val_loss={self.best_loss:.4f}")
 
-            if self.scheduler is not None and isinstance(
-                self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau
-            ):
-                self.scheduler.step(val_loss)
-                self._log("info", f"LR: {self.scheduler.get_last_lr()[0]:.6f}")
+            self._step_scheduler(val_loss)
+            new_lr = self._current_lr()
+            if new_lr != lr:
+                self._log("info", f"LR: {lr:.8f} -> {new_lr:.8f}")
+
+            metric_vals = [round(v, 6) for v in val_metrics.values()]
+            self._append_csv_row(
+                model_save_dir,
+                [epoch, f"{epoch_loss:.6f}", f"{val_loss:.6f}", f"{new_lr:.8f}", f"{epoch_time:.1f}"] + metric_vals,
+            )
 
             early_stopping(val_loss)
             if early_stopping.early_stop:
-                self._log("info", "Early stopping triggered")
+                self._log("info", f"Early stopping triggered (patience={early_stopping.counter}/{patience})")
                 break
 
         total_time = time.time() - t_start
@@ -249,21 +309,16 @@ class Core(nn.Module):
     def evaluate(
         self, data_loader, verbose: bool = False
     ) -> tuple[float, dict[str, float]]:
-        device = next(self.parameters()).device
         self.eval()
         total_loss = 0.0
         metric_results = {name: [] for name in self.metrics}
 
         with torch.no_grad():
             for batch in tqdm(data_loader, desc="Evaluating", leave=False):
-                inputs, targets = batch[0].to(device), batch[1].to(device)
-                outputs = self(inputs)
-
-                loss = self.criterion(outputs, targets)
+                loss, step_metrics = self._eval_step(batch)
                 total_loss += loss.item()
-
-                for name, fn in self.metrics.items():
-                    metric_results[name].append(fn(outputs, targets))
+                for name, val in step_metrics.items():
+                    metric_results[name].append(val)
 
         avg_loss = total_loss / len(data_loader)
         avg_metrics = {
@@ -278,11 +333,10 @@ class Core(nn.Module):
 
     @torch.no_grad()
     def predict(self, *args, **kwargs):
-        device = next(self.parameters()).device
         self.eval()
-        args = tuple(a.to(device) if isinstance(a, torch.Tensor) else a for a in args)
+        args = tuple(a.to(self.device) if isinstance(a, torch.Tensor) else a for a in args)
         kwargs = {
-            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            k: v.to(self.device) if isinstance(v, torch.Tensor) else v
             for k, v in kwargs.items()
         }
         return self(*args, **kwargs)
@@ -303,11 +357,12 @@ class Core(nn.Module):
         if self.scheduler is not None:
             save_dict["scheduler_state_dict"] = self.scheduler.state_dict()
 
-        try:
-            torch.save(save_dict, save_path, pickle_protocol=4)
-            self._log("info", f"Saved to {save_path}")
-        except Exception as e:
-            self._log("error", f"Failed to save: {e}")
+        self._atomic_save(save_dict, save_path)
+        self._log("info", f"Saved to {save_path}")
+
+    def _save_weights(self, model_dir: str):
+        path = os.path.join(model_dir, self._weights_filename())
+        self._atomic_save(self.state_dict(), path)
 
     def load(
         self,
@@ -323,7 +378,7 @@ class Core(nn.Module):
             self.best_loss = None
             return
 
-        checkpoint = torch.load(load_path, weights_only=False)
+        checkpoint = torch.load(load_path, map_location="cpu", weights_only=True)
         self.load_state_dict(checkpoint["model_state_dict"])
         self.last_epoch = checkpoint.get("epoch", 0)
         self.best_loss = checkpoint.get("best_val", None)
@@ -338,6 +393,11 @@ class Core(nn.Module):
             f"Loaded from {load_path}, epoch={self.last_epoch}, best_loss={self.best_loss}",
         )
 
+    def load_weights(self, path: str):
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        self.load_state_dict(state)
+        self._log("info", f"Loaded weights from {path}")
+
     def transfer(self, specified_path: str, strict: bool = False):
         if not specified_path:
             raise ValueError("Transfer path not specified.")
@@ -345,7 +405,7 @@ class Core(nn.Module):
             raise FileNotFoundError(f"Transfer path not found: {specified_path}")
 
         self._log("info", f"Transferring from {specified_path}")
-        checkpoint = torch.load(specified_path, weights_only=False)
+        checkpoint = torch.load(specified_path, map_location="cpu", weights_only=True)
         src_state = checkpoint.get("model_state_dict", checkpoint)
         dst_state = self.state_dict()
 
@@ -372,3 +432,16 @@ class Core(nn.Module):
             self._log("info", f"Missing: {missing}")
         if size_mismatch:
             self._log("info", f"Size mismatch: {size_mismatch}")
+
+    @staticmethod
+    def _atomic_save(obj, path: str):
+        dir_name = os.path.dirname(path)
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                torch.save(obj, f)
+            os.replace(tmp_path, path)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
