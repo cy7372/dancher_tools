@@ -1,4 +1,4 @@
-import csv
+import json
 import os
 import tempfile
 import logging
@@ -92,22 +92,14 @@ class Core(nn.Module):
         else:
             print(msg)
 
-    # ── CSV log ──────────────────────────────────────────────
+    # ── JSONL log ─────────────────────────────────────────────
 
-    def _csv_path(self, save_dir: str) -> str:
-        return os.path.join(save_dir, "training_log.csv")
+    def _log_path(self, save_dir: str) -> str:
+        return os.path.join(save_dir, "training_log.jsonl")
 
-    def _write_csv_header(self, save_dir: str):
-        header = ["epoch", "train_loss", "val_loss", "lr", "time"]
-        header.extend(self.metrics.keys())
-        with open(self._csv_path(save_dir), "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(header)
-
-    def _append_csv_row(self, save_dir: str, row: list):
-        with open(self._csv_path(save_dir), "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(row)
+    def _append_log_row(self, save_dir: str, row: dict):
+        with open(self._log_path(save_dir), "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     # ── Helpers ──────────────────────────────────────────────
 
@@ -229,7 +221,6 @@ class Core(nn.Module):
         grad_clip: float | None = 1.0,
     ):
         self._setup_logger(model_save_dir)
-        self._write_csv_header(model_save_dir)
 
         early_stopping = EarlyStopping(patience=patience, delta=delta)
         start_epoch = getattr(self, "last_epoch", 0)
@@ -285,10 +276,16 @@ class Core(nn.Module):
             if new_lr != lr:
                 self._log("info", f"LR: {lr:.8f} -> {new_lr:.8f}")
 
-            metric_vals = [round(v, 6) for v in val_metrics.values()]
-            self._append_csv_row(
+            self._append_log_row(
                 model_save_dir,
-                [epoch, f"{epoch_loss:.6f}", f"{val_loss:.6f}", f"{new_lr:.8f}", f"{epoch_time:.1f}"] + metric_vals,
+                {
+                    "epoch": epoch,
+                    "train_loss": round(epoch_loss, 6),
+                    "val_loss": round(val_loss, 6),
+                    "lr": new_lr,
+                    "time": round(epoch_time, 1),
+                    **{k: round(v, 6) for k, v in val_metrics.items()},
+                },
             )
 
             early_stopping(val_loss)
@@ -350,7 +347,7 @@ class Core(nn.Module):
         save_dict = {
             "epoch": self.last_epoch,
             "model_state_dict": self.state_dict(),
-            "best_val": self.best_loss,
+            "best_loss": self.best_loss,
         }
         if self.optimizer is not None:
             save_dict["optimizer_state_dict"] = self.optimizer.state_dict()
@@ -381,7 +378,7 @@ class Core(nn.Module):
         checkpoint = torch.load(load_path, map_location="cpu", weights_only=True)
         self.load_state_dict(checkpoint["model_state_dict"])
         self.last_epoch = checkpoint.get("epoch", 0)
-        self.best_loss = checkpoint.get("best_val", None)
+        self.best_loss = checkpoint.get("best_loss", None)
 
         if self.optimizer is not None and "optimizer_state_dict" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
