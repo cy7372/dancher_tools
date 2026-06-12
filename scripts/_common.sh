@@ -56,7 +56,9 @@ _wrap_torchrun() {
 
     if [ "$num_gpus" -gt 1 ]; then
         local master_port=29500
-        while ss -tlnp 2>/dev/null | grep -q ":${master_port} "; do master_port=$((master_port + 1)); done
+        while ss -tlnp 2>/dev/null | grep -q ":${master_port} " && [ "$master_port" -lt 29600 ]; do
+            master_port=$((master_port + 1))
+        done
         _CMD=(torchrun --nproc_per_node="${num_gpus}" --master_port="${master_port}" "${_CMD[@]}")
     fi
 

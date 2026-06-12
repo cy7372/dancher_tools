@@ -17,12 +17,14 @@ class EvalMixin:
 
     target_mean: float
     target_std: float
+    eval_criterion: nn.Module | None
 
     def _eval_step(self, batch) -> tuple[torch.Tensor, dict[str, float]]:
         inputs, targets = batch[0].to(self.device), batch[1].to(self.device)
         outputs = self(inputs)
         outputs_denorm = outputs * self.target_std + self.target_mean
-        loss = F.l1_loss(outputs_denorm, targets)
+        criterion = getattr(self, "eval_criterion", None) or F.l1_loss
+        loss = criterion(outputs_denorm, targets)
         step_metrics = {name: fn(outputs_denorm, targets) for name, fn in self.metrics.items()}
         return loss, step_metrics
 

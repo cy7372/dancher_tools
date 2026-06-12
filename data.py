@@ -81,6 +81,7 @@ class MmapArrayDataset(Dataset):
         target_path: str,
         input_stats: Optional[Dict[str, float]] = None,
         normalize_target: bool = True,
+        add_channel_dim: bool = True,
     ):
         s = time.time()
         steps = ["mmap input", "mmap target", "input stats", "target stats"]
@@ -118,6 +119,7 @@ class MmapArrayDataset(Dataset):
         self._inp_raw = inp_raw
         self._tgt_raw = tgt_raw
         self._need_cast = inp_raw.dtype != np.float32
+        self._add_channel = add_channel_dim
 
         elapsed = time.time() - s
         inp_shape = "x".join(str(d) for d in inp_raw.shape)
@@ -142,7 +144,10 @@ class MmapArrayDataset(Dataset):
             tgt = tgt.astype(np.float32)
         inp = (inp - self.input_mean) / self.input_std
         tgt = (tgt - self.target_mean) / self.target_std
+        if self._add_channel:
+            inp = inp[np.newaxis]
+            tgt = tgt[np.newaxis]
         return (
-            torch.from_numpy(np.ascontiguousarray(inp[np.newaxis])),
-            torch.from_numpy(np.ascontiguousarray(tgt[np.newaxis])),
+            torch.from_numpy(np.ascontiguousarray(inp)),
+            torch.from_numpy(np.ascontiguousarray(tgt)),
         )
