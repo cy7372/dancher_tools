@@ -114,7 +114,8 @@ class Core(nn.Module):
                     raise ValueError(f"Metric '{name}' is not callable.")
                 self.metrics[name] = fn
 
-        self._log(f"Compiled with metrics: {list(self.metrics.keys())}")
+        if self.metrics:
+            self._log(f"Compiled with metrics: {list(self.metrics.keys())}")
 
     # ── Logging ──────────────────────────────────────────────
 
