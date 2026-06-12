@@ -426,7 +426,7 @@ class Core(nn.Module):
 
     # ── Save / Load / Transfer ───────────────────────────────
 
-    def save(self, model_dir: str = "./checkpoints", mode: str = "latest"):
+    def save(self, model_dir: str = "./checkpoints", mode: str = "best"):
         if not self.is_main:
             return
         os.makedirs(model_dir, exist_ok=True)
@@ -453,7 +453,7 @@ class Core(nn.Module):
     def load(
         self,
         model_dir: str = "./checkpoints",
-        mode: str = "latest",
+        mode: str = "best",
         specified_path: str | None = None,
     ):
         load_path = specified_path or os.path.join(model_dir, self._filename(mode))
