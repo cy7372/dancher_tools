@@ -37,7 +37,7 @@ class Core(nn.Module):
     # ── DDP ──────────────────────────────────────────────────
 
     def _setup_ddp(self):
-        """Initialize DDP if detected. Sets rank/device info."""
+        """Initialize DDP if detected. Sets rank/device info and moves model."""
         from .utils import is_ddp, ddp_info
 
         if is_ddp():
@@ -47,8 +47,8 @@ class Core(nn.Module):
             self._ddp_local_rank = local_rank
             device = torch.device(f"cuda:{local_rank}")
             torch.cuda.set_device(device)
-            return device
-        return None
+            self.to(device)
+        return self._ddp_world_size > 1
 
     def _setup_dataloaders(self, train_data, val_data, batch_size: int):
         """Accept DataLoader, Dataset, or DataModule. Returns (train_loader, val_loader)."""
@@ -256,30 +256,23 @@ class Core(nn.Module):
         save_interval: int = 1,
         grad_clip: float | None = 1.0,
     ):
-        # ── DDP init ──
-        ddp_device = self._setup_ddp()
-        if ddp_device is not None:
-            self.to(ddp_device)
-
-        # ── Resolve data ──
-        train_loader, val_loader = self._setup_dataloaders(train_data, val_data, batch_size)
-
-        # ── DDP wrap ──
-        from .utils import is_ddp, ddp_cleanup
-
-        wrapped = is_ddp()
+        # ── DDP init + wrap ──
+        wrapped = self._setup_ddp()
         if wrapped:
             from torch.nn.parallel import DistributedDataParallel as DDP
             self._ddp_wrapped = DDP(self, device_ids=[self._ddp_local_rank])
         else:
             self._ddp_wrapped = None
 
+        # ── Resolve data ──
+        train_loader, val_loader = self._setup_dataloaders(train_data, val_data, batch_size)
+
         if self.is_main:
             n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
             self._log(f"Trainable params: {n_params:,}")
             if wrapped:
                 self._log(f"DDP: {self._ddp_world_size} GPUs, rank={self._ddp_rank}")
-            self.summary()
+            self._log(f"Device: {self.device}")
 
         early_stopping = EarlyStopping(patience=patience, delta=delta)
         start_epoch = getattr(self, "last_epoch", 0)
@@ -369,11 +362,11 @@ class Core(nn.Module):
             total_time = time.time() - t_start
             self.load(model_dir=model_save_dir, mode="best")
             self._log(
-                "info",
                 f"Training complete. Best val_loss: {self.best_loss:.4f} | "
                 f"Total time: {total_time / 60:.1f}min",
             )
         finally:
+            from .utils import ddp_cleanup
             del self._ddp_wrapped
             self._ddp_wrapped = None
             ddp_cleanup()
@@ -462,7 +455,6 @@ class Core(nn.Module):
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
         self._log(
-            "info",
             f"Loaded from {load_path}, epoch={self.last_epoch}, best_loss={self.best_loss}",
         )
 
@@ -497,7 +489,6 @@ class Core(nn.Module):
 
         self.load_state_dict(new_state, strict=False)
         self._log(
-            "info",
             f"Transfer: {len(new_state)} matched, {len(missing)} missing, "
             f"{len(size_mismatch)} size mismatch",
         )
