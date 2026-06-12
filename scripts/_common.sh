@@ -18,7 +18,7 @@ _dotenv="$(dirname "$PROJECT_ROOT")/.env"
 [ -f "$_dotenv" ] && { set -a; source "$_dotenv"; set +a; }
 
 : "${CONDA_PATH:?CONDA_PATH not set — check .env}"
-CONDA_ENV="${CONDA_ENV:-base}"
+: "${CONDA_ENV:?CONDA_ENV not set — check .env}"
 
 set -euo pipefail
 
