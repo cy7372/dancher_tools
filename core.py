@@ -372,10 +372,11 @@ class Core(nn.Module):
                 new_lr = self._current_lr()
 
                 # Compact epoch summary
+                best_flag = " *" if is_best else "  "
                 parts = [
                     f"[{epoch}/{total_epochs}]",
                     f"train={epoch_loss:.4f}",
-                    f"val={val_loss:.4f}{" *" if is_best else "  "}",
+                    f"val={val_loss:.4f}{best_flag}",
                     f"lr={new_lr:.2e}",
                     f"{epoch_time:.0f}s",
                 ]
