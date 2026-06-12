@@ -19,7 +19,7 @@ class Core(nn.Module):
         self.best_loss: float | None = None
         self.optimizer: torch.optim.Optimizer | None = None
         self.scheduler = None
-        self.criterion: nn.Module | None = None
+        self.criterion: callable | None = None
         self.metrics: dict = {}
         self._ddp_rank: int = 0
         self._ddp_world_size: int = 1
@@ -88,7 +88,7 @@ class Core(nn.Module):
 
     def compile(
         self,
-        criterion: nn.Module | list[nn.Module],
+        criterion: callable | list[callable],
         optimizer: torch.optim.Optimizer | None = None,
         scheduler=None,
         metrics: dict[str, callable] | None = None,
@@ -146,15 +146,17 @@ class Core(nn.Module):
     # ── Helpers ──────────────────────────────────────────────
 
     def _filename(self, mode: str) -> str:
+        name = self.model_name or "model"
         table = {
-            "best": f"{self.model_name}_best.pth",
+            "best": f"{name}_best.pth",
         }
         if mode not in table:
             raise ValueError(f"Invalid mode '{mode}'. Use: {list(table.keys())}")
         return table[mode]
 
     def _weights_filename(self) -> str:
-        return f"{self.model_name}_weights.pth"
+        name = self.model_name or "model"
+        return f"{name}_weights.pth"
 
     def count_params(self) -> dict[str, int]:
         total = sum(p.numel() for p in self.parameters())
@@ -291,6 +293,11 @@ class Core(nn.Module):
             train_data, val_data, batch_size, num_workers=num_workers, pin_memory=pin_memory
         )
 
+        if self.optimizer is None:
+            raise RuntimeError("No optimizer — call compile() before fit()")
+        if self.criterion is None:
+            raise RuntimeError("No criterion — call compile() before fit()")
+
         if self.is_main:
             n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
             self._log(f"Trainable params: {n_params:,}")
@@ -365,11 +372,10 @@ class Core(nn.Module):
                 new_lr = self._current_lr()
 
                 # Compact epoch summary
-                best_flag = " *" if is_best else ""
                 parts = [
                     f"[{epoch}/{total_epochs}]",
                     f"train={epoch_loss:.4f}",
-                    f"val={val_loss:.4f}{best_flag}",
+                    f"val={val_loss:.4f}{" *" if is_best else "  "}",
                     f"lr={new_lr:.2e}",
                     f"{epoch_time:.0f}s",
                 ]

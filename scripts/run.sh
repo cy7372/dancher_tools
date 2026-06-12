@@ -35,11 +35,20 @@ if [ ! -f "$CONFIG_FILE" ]; then
     exit 1
 fi
 
-# Map YAML keys → shell variables for your project here.
-# Example:
-#   MODEL="${model:?model not set in ${CONFIG}.yaml}"
-#   VAR="${var:?var not set in ${CONFIG}.yaml}"
-#   BATCH_SIZE="${batch_size:-4}"
-#   ...
+source "${PROJECT_ROOT}/dancher_tools/scripts/_parse_yaml.sh"
+_parse_yaml "$CONFIG_FILE"
+
+# ── Map YAML keys → shell variables ──────────────────────────
+# YAML keys become lowercase shell vars after _parse_yaml.
+# Example YAML:
+#   model: my_model       →  MODEL="${model}"
+#   epochs: 500           →  EPOCHS="${epochs:-500}"
+#   batch_size: 4         →  BATCH_SIZE="${batch_size:-4}"
+#
+# Uncomment and customize:
+MODEL="${model:?model not set in ${CONFIG}.yaml}"
+# EPOCHS="${epochs:-500}"
+# BATCH_SIZE="${batch_size:-4}"
+# LR="${lr:-1e-3}"
 
 source "${SCRIPT_DIR}/_common.sh"

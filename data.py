@@ -27,10 +27,12 @@ class DataModule:
     def __init__(
         self,
         batch_size: int = 2,
+        val_batch_size: int = 1,
         num_workers: int = 0,
         pin_memory: bool = False,
     ):
         self.batch_size = batch_size
+        self.val_batch_size = val_batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.train_ds = None
@@ -61,7 +63,7 @@ class DataModule:
     def val_dataloader(self) -> DataLoader:
         if self.val_ds is None:
             raise RuntimeError("Call setup() first or set val_ds")
-        return DataLoader(self.val_ds, batch_size=1, shuffle=False)
+        return DataLoader(self.val_ds, batch_size=self.val_batch_size, shuffle=False)
 
 
 class MmapArrayDataset(Dataset):
