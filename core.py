@@ -1,7 +1,6 @@
 import json
 import os
 import tempfile
-import logging
 import time
 
 import numpy as np
@@ -22,8 +21,6 @@ class Core(nn.Module):
         self.scheduler = None
         self.criterion: nn.Module | None = None
         self.metrics: dict = {}
-        self._logger: logging.Logger | None = None
-        self._log_dir: str | None = None
         self._ddp_rank: int = 0
         self._ddp_world_size: int = 1
         self._ddp_local_rank: int = 0
@@ -117,37 +114,12 @@ class Core(nn.Module):
                     raise ValueError(f"Metric '{name}' is not callable.")
                 self.metrics[name] = fn
 
-        self._log("info", f"Compiled with metrics: {list(self.metrics.keys())}")
+        self._log(f"Compiled with metrics: {list(self.metrics.keys())}")
 
     # ── Logging ──────────────────────────────────────────────
 
-    def _setup_logger(self, log_dir: str):
-        if self._logger is not None and self._log_dir == log_dir:
-            return
-
-        self._logger = logging.getLogger(f"dancher.{id(self)}")
-        self._logger.setLevel(logging.INFO)
-        self._logger.handlers.clear()
-
-        fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-
-        console = logging.StreamHandler()
-        console.setFormatter(fmt)
-        self._logger.addHandler(console)
-
-        os.makedirs(log_dir, exist_ok=True)
-        file_handler = logging.FileHandler(
-            os.path.join(log_dir, "training.log"), encoding="utf-8"
-        )
-        file_handler.setFormatter(fmt)
-        self._logger.addHandler(file_handler)
-        self._log_dir = log_dir
-
-    def _log(self, level: str, msg: str):
-        if self._logger is not None:
-            getattr(self._logger, level)(msg)
-        else:
-            print(msg)
+    def _log(self, msg: str):
+        print(msg, flush=True)
 
     # ── JSONL log ─────────────────────────────────────────────
 
@@ -208,30 +180,30 @@ class Core(nn.Module):
                 rows.append(f"... and {len(sorted_modules) - max_layers} more layers")
 
         msg = "\n".join(rows)
-        self._log("info", msg)
+        self._log(msg)
         return params
 
     def freeze(self, layers: list[str] | None = None):
         if layers is None:
             for p in self.parameters():
                 p.requires_grad = False
-            self._log("info", "Froze all parameters")
+            self._log("Froze all parameters")
         else:
             for name, param in self.named_parameters():
                 if any(name.startswith(l) for l in layers):
                     param.requires_grad = False
-            self._log("info", f"Froze layers matching: {layers}")
+            self._log(f"Froze layers matching: {layers}")
 
     def unfreeze(self, layers: list[str] | None = None):
         if layers is None:
             for p in self.parameters():
                 p.requires_grad = True
-            self._log("info", "Unfroze all parameters")
+            self._log("Unfroze all parameters")
         else:
             for name, param in self.named_parameters():
                 if any(name.startswith(l) for l in layers):
                     param.requires_grad = True
-            self._log("info", f"Unfroze layers matching: {layers}")
+            self._log(f"Unfroze layers matching: {layers}")
 
     # ── Training hooks (override for custom training steps) ───
 
@@ -302,20 +274,18 @@ class Core(nn.Module):
         else:
             self._ddp_wrapped = None
 
-        self._setup_logger(model_save_dir)
-
         if self.is_main:
             n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-            self._log("info", f"Trainable params: {n_params:,}")
+            self._log(f"Trainable params: {n_params:,}")
             if wrapped:
-                self._log("info", f"DDP: {self._ddp_world_size} GPUs, rank={self._ddp_rank}")
+                self._log(f"DDP: {self._ddp_world_size} GPUs, rank={self._ddp_rank}")
             self.summary()
 
         early_stopping = EarlyStopping(patience=patience, delta=delta)
         start_epoch = getattr(self, "last_epoch", 0)
         total_epochs = start_epoch + num_epochs
 
-        self._log("info", f"Training epoch {start_epoch + 1} -> {total_epochs}")
+        self._log(f"Training epoch {start_epoch + 1} -> {total_epochs}")
         t_start = time.time()
 
         try:
@@ -376,7 +346,7 @@ class Core(nn.Module):
                     parts.append(" ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
                 if early_stopping.counter > 0:
                     parts.append(f"patience={early_stopping.counter}/{patience}")
-                self._log("info", " | ".join(parts))
+                self._log(" | ".join(parts))
 
                 self._append_log_row(
                     model_save_dir,
@@ -393,7 +363,7 @@ class Core(nn.Module):
 
                 early_stopping(val_loss)
                 if early_stopping.early_stop:
-                    self._log("info", f"Early stopping triggered (patience={early_stopping.counter}/{patience})")
+                    self._log(f"Early stopping triggered (patience={early_stopping.counter}/{patience})")
                     break
 
             total_time = time.time() - t_start
@@ -430,7 +400,7 @@ class Core(nn.Module):
         }
 
         if verbose:
-            self._log("info", f"Val Loss: {avg_loss:.4f} | Metrics: {avg_metrics}")
+            self._log(f"Val Loss: {avg_loss:.4f} | Metrics: {avg_metrics}")
         return avg_loss, avg_metrics
 
     # ── Predict ──────────────────────────────────────────────
@@ -476,7 +446,7 @@ class Core(nn.Module):
         load_path = specified_path or os.path.join(model_dir, self._filename(mode))
 
         if not os.path.exists(load_path):
-            self._log("info", f"No checkpoint at {load_path}, starting from scratch")
+            self._log(f"No checkpoint at {load_path}, starting from scratch")
             self.last_epoch = 0
             self.best_loss = None
             return
@@ -499,7 +469,7 @@ class Core(nn.Module):
     def load_weights(self, path: str):
         state = torch.load(path, map_location="cpu", weights_only=True)
         self.load_state_dict(state)
-        self._log("info", f"Loaded weights from {path}")
+        self._log(f"Loaded weights from {path}")
 
     def transfer(self, specified_path: str, strict: bool = False):
         if not specified_path:
@@ -507,7 +477,7 @@ class Core(nn.Module):
         if not os.path.exists(specified_path):
             raise FileNotFoundError(f"Transfer path not found: {specified_path}")
 
-        self._log("info", f"Transferring from {specified_path}")
+        self._log(f"Transferring from {specified_path}")
         checkpoint = torch.load(specified_path, map_location="cpu", weights_only=True)
         src_state = checkpoint.get("model_state_dict", checkpoint)
         dst_state = self.state_dict()
@@ -532,9 +502,9 @@ class Core(nn.Module):
             f"{len(size_mismatch)} size mismatch",
         )
         if missing:
-            self._log("info", f"Missing: {missing}")
+            self._log(f"Missing: {missing}")
         if size_mismatch:
-            self._log("info", f"Size mismatch: {size_mismatch}")
+            self._log(f"Size mismatch: {size_mismatch}")
 
     @staticmethod
     def _atomic_save(obj, path: str):
