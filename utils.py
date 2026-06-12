@@ -1,6 +1,38 @@
+import os
+
 import torch
 import torch.nn as nn
 
+
+# ---------------------------------------------------------------------------
+# DDP helpers
+# ---------------------------------------------------------------------------
+
+def is_ddp() -> bool:
+    return "RANK" in os.environ
+
+
+def ddp_info() -> tuple[int, int, int]:
+    """Returns (rank, world_size, local_rank). Initializes process group if DDP."""
+    if is_ddp():
+        import torch.distributed as dist
+        from datetime import timedelta
+
+        dist.init_process_group("nccl", timeout=timedelta(minutes=30))
+        return dist.get_rank(), dist.get_world_size(), int(os.environ["LOCAL_RANK"])
+    return 0, 1, 0
+
+
+def ddp_cleanup():
+    if is_ddp():
+        import torch.distributed as dist
+
+        dist.destroy_process_group()
+
+
+# ---------------------------------------------------------------------------
+# Training utilities
+# ---------------------------------------------------------------------------
 
 class EarlyStopping:
     def __init__(self, patience: int = 15, delta: float = 0):

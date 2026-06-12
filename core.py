@@ -24,10 +24,67 @@ class Core(nn.Module):
         self.metrics: dict = {}
         self._logger: logging.Logger | None = None
         self._log_dir: str | None = None
+        self._ddp_rank: int = 0
+        self._ddp_world_size: int = 1
+        self._ddp_local_rank: int = 0
+        self._ddp_wrapped = None
 
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
+
+    @property
+    def is_main(self) -> bool:
+        return self._ddp_rank == 0
+
+    # ── DDP ──────────────────────────────────────────────────
+
+    def _setup_ddp(self):
+        """Initialize DDP if detected. Sets rank/device info."""
+        from .utils import is_ddp, ddp_info
+
+        if is_ddp():
+            rank, world_size, local_rank = ddp_info()
+            self._ddp_rank = rank
+            self._ddp_world_size = world_size
+            self._ddp_local_rank = local_rank
+            device = torch.device(f"cuda:{local_rank}")
+            torch.cuda.set_device(device)
+            return device
+        return None
+
+    def _setup_dataloaders(self, train_data, val_data, batch_size: int):
+        """Accept DataLoader, Dataset, or DataModule. Returns (train_loader, val_loader)."""
+        from torch.utils.data import Dataset, DataLoader
+        from .data import DataModule
+
+        if isinstance(train_data, DataModule):
+            if train_data.train_ds is None:
+                train_data.setup()
+            return train_data.train_dataloader(), train_data.val_dataloader()
+
+        if isinstance(train_data, Dataset):
+            from .utils import is_ddp
+
+            sampler = None
+            shuffle = True
+            if is_ddp():
+                from torch.utils.data.distributed import DistributedSampler
+
+                sampler = DistributedSampler(train_data, shuffle=True)
+                shuffle = False
+            train_loader = DataLoader(
+                train_data,
+                batch_size=batch_size,
+                sampler=sampler,
+                shuffle=shuffle,
+                num_workers=2,
+                pin_memory=True,
+            )
+            val_loader = DataLoader(val_data, batch_size=1, shuffle=False)
+            return train_loader, val_loader
+
+        return train_data, val_data
 
     def compile(
         self,
@@ -178,9 +235,15 @@ class Core(nn.Module):
 
     # ── Training hooks (override for custom training steps) ───
 
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass — goes through DDP wrapper when active."""
+        if self._ddp_wrapped is not None:
+            return self._ddp_wrapped(x)
+        return self(x)
+
     def _training_step(self, batch) -> torch.Tensor:
         inputs, targets = batch[0].to(self.device), batch[1].to(self.device)
-        outputs = self(inputs)
+        outputs = self._forward(inputs)
         return self.criterion(outputs, targets)
 
     def _eval_step(self, batch) -> tuple[torch.Tensor, dict[str, float]]:
@@ -210,9 +273,10 @@ class Core(nn.Module):
 
     def fit(
         self,
-        train_loader,
-        val_loader,
+        train_data,
+        val_data=None,
         num_epochs: int = 500,
+        batch_size: int = 2,
         model_save_dir: str = "./checkpoints/",
         patience: int = 15,
         delta: float = 0.01,
@@ -220,86 +284,129 @@ class Core(nn.Module):
         save_interval: int = 1,
         grad_clip: float | None = 1.0,
     ):
+        # ── DDP init ──
+        ddp_device = self._setup_ddp()
+        if ddp_device is not None:
+            self.to(ddp_device)
+
+        # ── Resolve data ──
+        train_loader, val_loader = self._setup_dataloaders(train_data, val_data, batch_size)
+
+        # ── DDP wrap ──
+        from .utils import is_ddp, ddp_cleanup
+
+        wrapped = is_ddp()
+        if wrapped:
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            self._ddp_wrapped = DDP(self, device_ids=[self._ddp_local_rank])
+        else:
+            self._ddp_wrapped = None
+
         self._setup_logger(model_save_dir)
+
+        if self.is_main:
+            n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+            self._log("info", f"Trainable params: {n_params:,}")
+            if wrapped:
+                self._log("info", f"DDP: {self._ddp_world_size} GPUs, rank={self._ddp_rank}")
+            self.summary()
 
         early_stopping = EarlyStopping(patience=patience, delta=delta)
         start_epoch = getattr(self, "last_epoch", 0)
         total_epochs = start_epoch + num_epochs
 
         self._log("info", f"Training epoch {start_epoch + 1} -> {total_epochs}")
-        self.summary()
-
         t_start = time.time()
 
-        for epoch in range(start_epoch + 1, total_epochs + 1):
-            self.last_epoch = epoch
-            self._log("info", f"\nEpoch {epoch}/{total_epochs}")
-            self.train()
-            running_loss = 0.0
-            t_epoch = time.time()
+        try:
+            for epoch in range(start_epoch + 1, total_epochs + 1):
+                self.last_epoch = epoch
 
-            for batch in tqdm(train_loader, desc="Training", leave=False):
-                self.optimizer.zero_grad()
-                loss = self._training_step(batch)
-                loss.backward()
+                if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+                    train_loader.sampler.set_epoch(epoch)
 
-                if grad_clip is not None:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.parameters(), max_norm=grad_clip
-                    )
-                self.optimizer.step()
+                self.train()
+                running_loss = 0.0
+                t_epoch = time.time()
 
-                running_loss += loss.item()
+                for batch in tqdm(
+                    train_loader,
+                    desc=f"Epoch {epoch}/{total_epochs}",
+                    leave=False,
+                ):
+                    self.optimizer.zero_grad()
+                    loss = self._training_step(batch)
+                    loss.backward()
 
-            epoch_loss = running_loss / len(train_loader)
-            epoch_time = time.time() - t_epoch
-            lr = self._current_lr()
+                    if grad_clip is not None:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.parameters(), max_norm=grad_clip
+                        )
+                    self.optimizer.step()
 
+                    running_loss += loss.item()
+
+                epoch_loss = running_loss / len(train_loader)
+                epoch_time = time.time() - t_epoch
+
+                if save_interval > 0 and epoch % save_interval == 0:
+                    self.save(model_dir=model_save_dir, mode="latest")
+
+                val_loss, val_metrics = self.evaluate(val_loader, verbose=False)
+
+                is_best = self.best_loss is None or val_loss < self.best_loss - min_delta
+                if is_best:
+                    self.best_loss = val_loss
+                    self.save(model_dir=model_save_dir, mode="best")
+                    self._save_weights(model_save_dir)
+
+                self._step_scheduler(val_loss)
+                new_lr = self._current_lr()
+
+                # Compact epoch summary
+                best_flag = " *" if is_best else ""
+                parts = [
+                    f"[{epoch}/{total_epochs}]",
+                    f"train={epoch_loss:.4f}",
+                    f"val={val_loss:.4f}{best_flag}",
+                    f"lr={new_lr:.2e}",
+                    f"{epoch_time:.0f}s",
+                ]
+                if val_metrics:
+                    parts.append(" ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()))
+                if early_stopping.counter > 0:
+                    parts.append(f"patience={early_stopping.counter}/{patience}")
+                self._log("info", " | ".join(parts))
+
+                self._append_log_row(
+                    model_save_dir,
+                    {
+                        "epoch": epoch,
+                        "train_loss": round(epoch_loss, 6),
+                        "val_loss": round(val_loss, 6),
+                        "lr": new_lr,
+                        "time": round(epoch_time, 1),
+                        "best": is_best,
+                        **{k: round(v, 6) for k, v in val_metrics.items()},
+                    },
+                )
+
+                early_stopping(val_loss)
+                if early_stopping.early_stop:
+                    self._log("info", f"Early stopping triggered (patience={early_stopping.counter}/{patience})")
+                    break
+
+            total_time = time.time() - t_start
+            self.load(model_dir=model_save_dir, mode="best")
             self._log(
                 "info",
-                f"Train Loss: {epoch_loss:.4f} | LR: {lr:.8f} | Time: {epoch_time:.1f}s",
+                f"Training complete. Best val_loss: {self.best_loss:.4f} | "
+                f"Total time: {total_time / 60:.1f}min",
             )
-
-            if save_interval > 0 and epoch % save_interval == 0:
-                self.save(model_dir=model_save_dir, mode="latest")
-
-            val_loss, val_metrics = self.evaluate(val_loader, verbose=True)
-
-            if self.best_loss is None or val_loss < self.best_loss - min_delta:
-                self.best_loss = val_loss
-                self.save(model_dir=model_save_dir, mode="best")
-                self._save_weights(model_save_dir)
-                self._log("info", f"New best model: val_loss={self.best_loss:.4f}")
-
-            self._step_scheduler(val_loss)
-            new_lr = self._current_lr()
-            if new_lr != lr:
-                self._log("info", f"LR: {lr:.8f} -> {new_lr:.8f}")
-
-            self._append_log_row(
-                model_save_dir,
-                {
-                    "epoch": epoch,
-                    "train_loss": round(epoch_loss, 6),
-                    "val_loss": round(val_loss, 6),
-                    "lr": new_lr,
-                    "time": round(epoch_time, 1),
-                    **{k: round(v, 6) for k, v in val_metrics.items()},
-                },
-            )
-
-            early_stopping(val_loss)
-            if early_stopping.early_stop:
-                self._log("info", f"Early stopping triggered (patience={early_stopping.counter}/{patience})")
-                break
-
-        total_time = time.time() - t_start
-        self.load(model_dir=model_save_dir, mode="best")
-        self._log(
-            "info",
-            f"Training complete. Best val_loss: {self.best_loss:.4f} | "
-            f"Total time: {total_time / 60:.1f}min",
-        )
+        finally:
+            del self._ddp_wrapped
+            self._ddp_wrapped = None
+            ddp_cleanup()
 
     # ── Evaluation ───────────────────────────────────────────
 
@@ -355,7 +462,6 @@ class Core(nn.Module):
             save_dict["scheduler_state_dict"] = self.scheduler.state_dict()
 
         self._atomic_save(save_dict, save_path)
-        self._log("info", f"Saved to {save_path}")
 
     def _save_weights(self, model_dir: str):
         path = os.path.join(model_dir, self._weights_filename())
