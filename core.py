@@ -156,8 +156,7 @@ class Core(nn.Module):
         return f"{name}_{tag}.pth"
 
     def _state_filename(self) -> str:
-        name = self.model_name or "model"
-        return f"{name}_state.pth"
+        return "train_state.pth"
 
     def count_params(self) -> dict[str, int]:
         total = sum(p.numel() for p in self.parameters())
