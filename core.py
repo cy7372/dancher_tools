@@ -151,9 +151,13 @@ class Core(nn.Module):
         """Override in subclass to return the model being trained."""
         return self
 
-    def _model_filename(self) -> str:
+    def _model_filename(self, tag: str) -> str:
         name = self.model_name or "model"
-        return f"{name}.pth"
+        return f"{name}_{tag}.pth"
+
+    def _state_filename(self) -> str:
+        name = self.model_name or "model"
+        return f"{name}_state.pth"
 
     def count_params(self) -> dict[str, int]:
         total = sum(p.numel() for p in self.parameters())
@@ -358,7 +362,8 @@ class Core(nn.Module):
                 is_best = self.best_loss is None or val_loss < self.best_loss - min_delta
                 if is_best:
                     self.best_loss = val_loss
-                    self.save(model_dir=model_save_dir)
+                    self.save(model_dir=model_save_dir, tag="best")
+                self.save(model_dir=model_save_dir, tag="latest")
 
                 if self._ddp_world_size > 1:
                     import torch.distributed as dist
@@ -458,20 +463,38 @@ class Core(nn.Module):
 
     # ── Save / Load / Transfer ───────────────────────────────
 
-    def save(self, model_dir: str = "./checkpoints"):
+    def save(self, model_dir: str = "./checkpoints", tag: str = "best"):
         if not self.is_main:
             return
         os.makedirs(model_dir, exist_ok=True)
-        save_path = os.path.join(model_dir, self._model_filename())
-        self._atomic_save(self._inner_model().state_dict(), save_path)
+        path = os.path.join(model_dir, self._model_filename(tag))
+        self._atomic_save(self._inner_model().state_dict(), path)
+        self._save_state(model_dir)
 
-    def load(self, model_dir: str | None = None, specified_path: str | None = None):
+    def _save_state(self, model_dir: str):
+        if not self.is_main:
+            return
+        state = {
+            "epoch": self.last_epoch,
+            "best_loss": self.best_loss,
+        }
+        if self.optimizer is not None:
+            state["optimizer_state_dict"] = self.optimizer.state_dict()
+        if self.scheduler is not None:
+            state["scheduler_state_dict"] = self.scheduler.state_dict()
+        if self._grad_scaler is not None:
+            state["scaler_state_dict"] = self._grad_scaler.state_dict()
+        path = os.path.join(model_dir, self._state_filename())
+        self._atomic_save(state, path)
+
+    def load(self, model_dir: str | None = None, tag: str = "best",
+             specified_path: str | None = None):
         if specified_path:
             load_path = specified_path
         elif model_dir:
-            load_path = os.path.join(model_dir, self._model_filename())
+            load_path = os.path.join(model_dir, self._model_filename(tag))
         else:
-            raise ValueError("Need model_dir or specified_path")
+            raise ValueError("Need model_dir or tag")
 
         if not os.path.exists(load_path):
             self._log(f"No checkpoint at {load_path}, starting from scratch")
@@ -479,9 +502,31 @@ class Core(nn.Module):
             self.best_loss = None
             return
 
-        checkpoint = torch.load(load_path, map_location="cpu", weights_only=True)
-        self._inner_model().load_state_dict(checkpoint)
+        state = torch.load(load_path, map_location="cpu", weights_only=True)
+        self._inner_model().load_state_dict(state)
         self._log(f"Loaded weights from {load_path}")
+
+    def _load_state(self, model_dir: str):
+        path = os.path.join(model_dir, self._state_filename())
+        if not os.path.exists(path):
+            return
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        self.last_epoch = state.get("epoch", 0)
+        self.best_loss = state.get("best_loss", None)
+        if self.optimizer is not None and "optimizer_state_dict" in state:
+            self.optimizer.load_state_dict(state["optimizer_state_dict"])
+        if self.scheduler is not None and "scheduler_state_dict" in state:
+            self.scheduler.load_state_dict(state["scheduler_state_dict"])
+        if self._grad_scaler is not None and "scaler_state_dict" in state:
+            self._grad_scaler.load_state_dict(state["scaler_state_dict"])
+
+    def resume(self, model_dir: str, tag: str = "latest"):
+        self.load(model_dir=model_dir, tag=tag)
+        self._load_state(model_dir)
+        self._log(
+            f"Resumed from {model_dir}/{self._model_filename(tag)}, "
+            f"epoch={self.last_epoch}, best_loss={self.best_loss}"
+        )
 
     def load_weights(self, path: str):
         state = torch.load(path, map_location="cpu", weights_only=True)
