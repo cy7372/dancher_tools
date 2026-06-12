@@ -484,11 +484,14 @@ class Core(nn.Module):
 
         self._atomic_save(save_dict, save_path)
 
+    def _weights_state_dict(self) -> dict:
+        return self.state_dict()
+
     def _save_weights(self, model_dir: str):
         if not self.is_main:
             return
         path = os.path.join(model_dir, self._weights_filename())
-        self._atomic_save(self.state_dict(), path)
+        self._atomic_save(self._weights_state_dict(), path)
 
     def load(
         self,
