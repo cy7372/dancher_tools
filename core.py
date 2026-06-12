@@ -137,7 +137,6 @@ class Core(nn.Module):
 
     def _filename(self, mode: str) -> str:
         table = {
-            "latest": f"{self.model_name}_latest.pth",
             "best": f"{self.model_name}_best.pth",
         }
         if mode not in table:
@@ -265,7 +264,6 @@ class Core(nn.Module):
         patience: int = 15,
         delta: float = 0.01,
         min_delta: float = 0.0,
-        save_interval: int = 1,
         grad_clip: float | None = 1.0,
     ):
         # ── DDP init + wrap ──
@@ -325,9 +323,6 @@ class Core(nn.Module):
                 epoch_loss = running_loss / len(train_loader)
                 epoch_loss = self._ddp_all_reduce(epoch_loss)
                 epoch_time = time.time() - t_epoch
-
-                if save_interval > 0 and epoch % save_interval == 0:
-                    self.save(model_dir=model_save_dir, mode="latest")
 
                 val_loss, val_metrics = self.evaluate(val_loader, verbose=False)
 
