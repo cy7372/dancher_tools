@@ -25,6 +25,8 @@ class Core(nn.Module):
         self._ddp_world_size: int = 1
         self._ddp_local_rank: int = 0
         self._ddp_wrapped = None
+        self._use_amp: bool = False
+        self._grad_scaler: torch.amp.GradScaler | None = None
 
     @property
     def device(self) -> torch.device:
@@ -90,9 +92,15 @@ class Core(nn.Module):
         scheduler=None,
         metrics: dict[str, callable] | None = None,
         loss_weights: list[float] | None = None,
+        amp: bool = False,
     ):
         self.optimizer = optimizer
         self.scheduler = scheduler
+
+        if amp:
+            self._use_amp = True
+            self._grad_scaler = torch.amp.GradScaler("cuda")
+            self._log("AMP enabled (float16 autocast)")
 
         if isinstance(criterion, list):
             match len(criterion):
@@ -310,14 +318,25 @@ class Core(nn.Module):
                     disable=not self.is_main,
                 ):
                     self.optimizer.zero_grad()
-                    loss = self._training_step(batch)
-                    loss.backward()
-
-                    if grad_clip is not None:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.parameters(), max_norm=grad_clip
-                        )
-                    self.optimizer.step()
+                    if self._use_amp:
+                        with torch.amp.autocast("cuda"):
+                            loss = self._training_step(batch)
+                        self._grad_scaler.scale(loss).backward()
+                        if grad_clip is not None:
+                            self._grad_scaler.unscale_(self.optimizer)
+                            torch.nn.utils.clip_grad_norm_(
+                                self.parameters(), max_norm=grad_clip
+                            )
+                        self._grad_scaler.step(self.optimizer)
+                        self._grad_scaler.update()
+                    else:
+                        loss = self._training_step(batch)
+                        loss.backward()
+                        if grad_clip is not None:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.parameters(), max_norm=grad_clip
+                            )
+                        self.optimizer.step()
 
                     running_loss += loss.item()
 
@@ -396,7 +415,11 @@ class Core(nn.Module):
 
         with torch.no_grad():
             for batch in tqdm(data_loader, desc="Evaluating", leave=False, disable=not self.is_main):
-                loss, step_metrics = self._eval_step(batch)
+                if self._use_amp:
+                    with torch.amp.autocast("cuda"):
+                        loss, step_metrics = self._eval_step(batch)
+                else:
+                    loss, step_metrics = self._eval_step(batch)
                 total_loss += loss.item()
                 for name, val in step_metrics.items():
                     metric_results[name].append(val)
@@ -442,6 +465,8 @@ class Core(nn.Module):
             save_dict["optimizer_state_dict"] = self.optimizer.state_dict()
         if self.scheduler is not None:
             save_dict["scheduler_state_dict"] = self.scheduler.state_dict()
+        if self._grad_scaler is not None:
+            save_dict["scaler_state_dict"] = self._grad_scaler.state_dict()
 
         self._atomic_save(save_dict, save_path)
 
@@ -474,6 +499,8 @@ class Core(nn.Module):
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if self._grad_scaler is not None and "scaler_state_dict" in checkpoint:
+            self._grad_scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
         self._log(
             f"Loaded from {load_path}, epoch={self.last_epoch}, best_loss={self.best_loss}",
