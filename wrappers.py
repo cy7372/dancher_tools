@@ -15,10 +15,6 @@ from .core import Core
 class EvalMixin:
     """Denormalize model output before computing eval metrics."""
 
-    target_mean: float
-    target_std: float
-    eval_criterion: nn.Module | None
-
     def _eval_step(self, batch) -> tuple[torch.Tensor, dict[str, float]]:
         inputs, targets = batch[0].to(self.device), batch[1].to(self.device)
         outputs = self(inputs)

@@ -52,7 +52,8 @@ class Core(nn.Module):
             self.to(device)
         return self._ddp_world_size > 1
 
-    def _setup_dataloaders(self, train_data, val_data, batch_size: int):
+    def _setup_dataloaders(self, train_data, val_data, batch_size: int,
+                           num_workers: int = 2, pin_memory: bool = True):
         """Accept DataLoader, Dataset, or DataModule. Returns (train_loader, val_loader)."""
         from torch.utils.data import Dataset, DataLoader
         from .data import DataModule
@@ -77,8 +78,8 @@ class Core(nn.Module):
                 batch_size=batch_size,
                 sampler=sampler,
                 shuffle=shuffle,
-                num_workers=2,
-                pin_memory=True,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
             )
             val_loader = DataLoader(val_data, batch_size=1, shuffle=False)
             return train_loader, val_loader
@@ -274,6 +275,8 @@ class Core(nn.Module):
         delta: float = 0.01,
         min_delta: float = 0.0,
         grad_clip: float | None = 1.0,
+        num_workers: int = 2,
+        pin_memory: bool = True,
     ):
         # ── DDP init + wrap ──
         wrapped = self._setup_ddp()
@@ -284,7 +287,9 @@ class Core(nn.Module):
             self._ddp_wrapped = None
 
         # ── Resolve data ──
-        train_loader, val_loader = self._setup_dataloaders(train_data, val_data, batch_size)
+        train_loader, val_loader = self._setup_dataloaders(
+            train_data, val_data, batch_size, num_workers=num_workers, pin_memory=pin_memory
+        )
 
         if self.is_main:
             n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)

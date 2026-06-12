@@ -118,7 +118,7 @@ class MmapArrayDataset(Dataset):
 
         self._inp_raw = inp_raw
         self._tgt_raw = tgt_raw
-        self._need_cast = inp_raw.dtype != np.float32
+        self._need_cast = (inp_raw.dtype != np.float32) or (tgt_raw.dtype != np.float32)
         self._add_channel = add_channel_dim
 
         elapsed = time.time() - s
