@@ -44,5 +44,5 @@ class SRWrapper(EvalMixin, Core):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
 
-    def _weights_state_dict(self) -> dict:
-        return self.model.state_dict()
+    def _inner_model(self) -> nn.Module:
+        return self.model

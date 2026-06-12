@@ -147,18 +147,13 @@ class Core(nn.Module):
 
     # ── Helpers ──────────────────────────────────────────────
 
-    def _filename(self, mode: str) -> str:
-        name = self.model_name or "model"
-        table = {
-            "best": f"{name}_best.pth",
-        }
-        if mode not in table:
-            raise ValueError(f"Invalid mode '{mode}'. Use: {list(table.keys())}")
-        return table[mode]
+    def _inner_model(self) -> nn.Module:
+        """Override in subclass to return the model being trained."""
+        return self
 
-    def _weights_filename(self) -> str:
+    def _model_filename(self) -> str:
         name = self.model_name or "model"
-        return f"{name}_weights.pth"
+        return f"{name}.pth"
 
     def count_params(self) -> dict[str, int]:
         total = sum(p.numel() for p in self.parameters())
@@ -363,8 +358,7 @@ class Core(nn.Module):
                 is_best = self.best_loss is None or val_loss < self.best_loss - min_delta
                 if is_best:
                     self.best_loss = val_loss
-                    self.save(model_dir=model_save_dir, mode="best")
-                    self._save_weights(model_save_dir)
+                    self.save(model_dir=model_save_dir)
 
                 if self._ddp_world_size > 1:
                     import torch.distributed as dist
@@ -407,7 +401,7 @@ class Core(nn.Module):
                     break
 
             total_time = time.time() - t_start
-            self.load(model_dir=model_save_dir, mode="best")
+            self.load(model_dir=model_save_dir)
             self._log(
                 f"Training complete. Best val_loss: {self.best_loss:.4f} | "
                 f"Total time: {total_time / 60:.1f}min",
@@ -464,42 +458,20 @@ class Core(nn.Module):
 
     # ── Save / Load / Transfer ───────────────────────────────
 
-    def save(self, model_dir: str = "./checkpoints", mode: str = "best"):
+    def save(self, model_dir: str = "./checkpoints"):
         if not self.is_main:
             return
         os.makedirs(model_dir, exist_ok=True)
+        save_path = os.path.join(model_dir, self._model_filename())
+        self._atomic_save(self._inner_model().state_dict(), save_path)
 
-        save_path = os.path.join(model_dir, self._filename(mode))
-        save_dict = {
-            "epoch": self.last_epoch,
-            "model_state_dict": self.state_dict(),
-            "best_loss": self.best_loss,
-        }
-        if self.optimizer is not None:
-            save_dict["optimizer_state_dict"] = self.optimizer.state_dict()
-        if self.scheduler is not None:
-            save_dict["scheduler_state_dict"] = self.scheduler.state_dict()
-        if self._grad_scaler is not None:
-            save_dict["scaler_state_dict"] = self._grad_scaler.state_dict()
-
-        self._atomic_save(save_dict, save_path)
-
-    def _weights_state_dict(self) -> dict:
-        return self.state_dict()
-
-    def _save_weights(self, model_dir: str):
-        if not self.is_main:
-            return
-        path = os.path.join(model_dir, self._weights_filename())
-        self._atomic_save(self._weights_state_dict(), path)
-
-    def load(
-        self,
-        model_dir: str = "./checkpoints",
-        mode: str = "best",
-        specified_path: str | None = None,
-    ):
-        load_path = specified_path or os.path.join(model_dir, self._filename(mode))
+    def load(self, model_dir: str | None = None, specified_path: str | None = None):
+        if specified_path:
+            load_path = specified_path
+        elif model_dir:
+            load_path = os.path.join(model_dir, self._model_filename())
+        else:
+            raise ValueError("Need model_dir or specified_path")
 
         if not os.path.exists(load_path):
             self._log(f"No checkpoint at {load_path}, starting from scratch")
@@ -508,59 +480,13 @@ class Core(nn.Module):
             return
 
         checkpoint = torch.load(load_path, map_location="cpu", weights_only=True)
-        self.load_state_dict(checkpoint["model_state_dict"])
-        self.last_epoch = checkpoint.get("epoch", 0)
-        self.best_loss = checkpoint.get("best_loss", None)
-
-        if self.optimizer is not None and "optimizer_state_dict" in checkpoint:
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        if self._grad_scaler is not None and "scaler_state_dict" in checkpoint:
-            self._grad_scaler.load_state_dict(checkpoint["scaler_state_dict"])
-
-        self._log(
-            f"Loaded from {load_path}, epoch={self.last_epoch}, best_loss={self.best_loss}",
-        )
+        self._inner_model().load_state_dict(checkpoint)
+        self._log(f"Loaded weights from {load_path}")
 
     def load_weights(self, path: str):
         state = torch.load(path, map_location="cpu", weights_only=True)
-        self.load_state_dict(state)
+        self._inner_model().load_state_dict(state)
         self._log(f"Loaded weights from {path}")
-
-    def transfer(self, specified_path: str, strict: bool = False):
-        if not specified_path:
-            raise ValueError("Transfer path not specified.")
-        if not os.path.exists(specified_path):
-            raise FileNotFoundError(f"Transfer path not found: {specified_path}")
-
-        self._log(f"Transferring from {specified_path}")
-        checkpoint = torch.load(specified_path, map_location="cpu", weights_only=True)
-        src_state = checkpoint.get("model_state_dict", checkpoint)
-        dst_state = self.state_dict()
-
-        new_state = {}
-        missing = []
-        size_mismatch = []
-
-        for name, param in dst_state.items():
-            if name in src_state:
-                if src_state[name].size() == param.size():
-                    new_state[name] = src_state[name]
-                else:
-                    size_mismatch.append(name)
-            else:
-                missing.append(name)
-
-        self.load_state_dict(new_state, strict=False)
-        self._log(
-            f"Transfer: {len(new_state)} matched, {len(missing)} missing, "
-            f"{len(size_mismatch)} size mismatch",
-        )
-        if missing:
-            self._log(f"Missing: {missing}")
-        if size_mismatch:
-            self._log(f"Size mismatch: {size_mismatch}")
 
     @staticmethod
     def _atomic_save(obj, path: str):
