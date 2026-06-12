@@ -119,7 +119,8 @@ class Core(nn.Module):
     # ── Logging ──────────────────────────────────────────────
 
     def _log(self, msg: str):
-        print(msg, flush=True)
+        if self.is_main:
+            print(msg, flush=True)
 
     # ── JSONL log ─────────────────────────────────────────────
 
@@ -127,6 +128,8 @@ class Core(nn.Module):
         return os.path.join(save_dir, "training_log.jsonl")
 
     def _append_log_row(self, save_dir: str, row: dict):
+        if not self.is_main:
+            return
         with open(self._log_path(save_dir), "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
@@ -241,6 +244,15 @@ class Core(nn.Module):
             return self.optimizer.param_groups[0]["lr"]
         return 0.0
 
+    def _ddp_all_reduce(self, value: float) -> float:
+        """Average a scalar across all DDP ranks. No-op in single-process."""
+        if self._ddp_world_size <= 1:
+            return value
+        import torch.distributed as dist
+        t = torch.tensor(value, device=self.device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        return (t / self._ddp_world_size).item()
+
     # ── Training ─────────────────────────────────────────────
 
     def fit(
@@ -296,6 +308,7 @@ class Core(nn.Module):
                     train_loader,
                     desc=f"Epoch {epoch}/{total_epochs}",
                     leave=False,
+                    disable=not self.is_main,
                 ):
                     self.optimizer.zero_grad()
                     loss = self._training_step(batch)
@@ -310,6 +323,7 @@ class Core(nn.Module):
                     running_loss += loss.item()
 
                 epoch_loss = running_loss / len(train_loader)
+                epoch_loss = self._ddp_all_reduce(epoch_loss)
                 epoch_time = time.time() - t_epoch
 
                 if save_interval > 0 and epoch % save_interval == 0:
@@ -322,6 +336,10 @@ class Core(nn.Module):
                     self.best_loss = val_loss
                     self.save(model_dir=model_save_dir, mode="best")
                     self._save_weights(model_save_dir)
+
+                if self._ddp_world_size > 1:
+                    import torch.distributed as dist
+                    dist.barrier()
 
                 self._step_scheduler(val_loss)
                 new_lr = self._current_lr()
@@ -381,15 +399,18 @@ class Core(nn.Module):
         metric_results = {name: [] for name in self.metrics}
 
         with torch.no_grad():
-            for batch in tqdm(data_loader, desc="Evaluating", leave=False):
+            for batch in tqdm(data_loader, desc="Evaluating", leave=False, disable=not self.is_main):
                 loss, step_metrics = self._eval_step(batch)
                 total_loss += loss.item()
                 for name, val in step_metrics.items():
                     metric_results[name].append(val)
 
         avg_loss = total_loss / len(data_loader)
+        avg_loss = self._ddp_all_reduce(avg_loss)
+
         avg_metrics = {
-            name: round(float(np.mean(vals)), 4) for name, vals in metric_results.items()
+            name: round(self._ddp_all_reduce(float(np.mean(vals))), 4)
+            for name, vals in metric_results.items()
         }
 
         if verbose:
@@ -411,6 +432,8 @@ class Core(nn.Module):
     # ── Save / Load / Transfer ───────────────────────────────
 
     def save(self, model_dir: str = "./checkpoints", mode: str = "latest"):
+        if not self.is_main:
+            return
         os.makedirs(model_dir, exist_ok=True)
 
         save_path = os.path.join(model_dir, self._filename(mode))
@@ -427,6 +450,8 @@ class Core(nn.Module):
         self._atomic_save(save_dict, save_path)
 
     def _save_weights(self, model_dir: str):
+        if not self.is_main:
+            return
         path = os.path.join(model_dir, self._weights_filename())
         self._atomic_save(self.state_dict(), path)
 
