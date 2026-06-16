@@ -31,6 +31,18 @@ def ddp_cleanup():
 
 
 # ---------------------------------------------------------------------------
+# Slice parsing
+# ---------------------------------------------------------------------------
+
+def parse_slices(slices_json: str | None) -> dict[int, slice] | None:
+    if slices_json is None:
+        return None
+    import json
+    raw = json.loads(slices_json)
+    return {int(k): slice(v[0], v[1]) for k, v in raw.items()}
+
+
+# ---------------------------------------------------------------------------
 # Training utilities
 # ---------------------------------------------------------------------------
 

@@ -10,6 +10,53 @@ from tqdm import tqdm
 from .utils import is_ddp
 
 
+# ---------------------------------------------------------------------------
+# Slice helper
+# ---------------------------------------------------------------------------
+
+def _apply_slices(data: np.ndarray, slices_dict: dict) -> np.ndarray:
+    full_slices = [slices_dict.get(i, slice(None)) for i in range(data.ndim)]
+    return data[tuple(full_slices)]
+
+
+# ---------------------------------------------------------------------------
+# Normalization helpers
+# ---------------------------------------------------------------------------
+
+def normalize(data: np.ndarray, mean: float, std: float) -> np.ndarray:
+    if std < 1e-8:
+        return data - mean
+    return (data - mean) / std
+
+
+def denormalize(data: np.ndarray, mean: float, std: float) -> np.ndarray:
+    return data * std + mean
+
+
+def denormalize_tensor(tensor: torch.Tensor, mean: float, std: float) -> torch.Tensor:
+    return tensor * std + mean
+
+
+# ---------------------------------------------------------------------------
+# Stats persistence
+# ---------------------------------------------------------------------------
+
+def save_stats(stats: dict, path: str) -> None:
+    arr = np.array([
+        stats["input"]["mean"], stats["input"]["std"],
+        stats["target"]["mean"], stats["target"]["std"],
+    ], dtype=np.float32)
+    np.save(path, arr)
+
+
+def load_stats(path: str) -> Dict[str, Dict[str, float]]:
+    arr = np.load(path)
+    return {
+        "input": {"mean": float(arr[0]), "std": float(arr[1])},
+        "target": {"mean": float(arr[2]), "std": float(arr[3])},
+    }
+
+
 class DataModule:
     """Base class for data setup. Override setup() to create train_ds / val_ds.
 
@@ -84,6 +131,8 @@ class MmapArrayDataset(Dataset):
         input_stats: Optional[Dict[str, float]] = None,
         normalize_target: bool = True,
         add_channel_dim: bool = True,
+        input_slices: Optional[Dict[int, slice]] = None,
+        target_slices: Optional[Dict[int, slice]] = None,
     ):
         s = time.time()
         steps = ["mmap input", "mmap target", "input stats", "target stats"]
@@ -92,11 +141,15 @@ class MmapArrayDataset(Dataset):
         inp_size = os.path.getsize(input_path) / 1e9
         pbar.set_postfix_str(f"input ({inp_size:.1f} GB)")
         inp_raw = np.load(input_path, mmap_mode="r")
+        if input_slices:
+            inp_raw = np.array(_apply_slices(np.asarray(inp_raw), input_slices))
         pbar.update(1)
 
         tgt_size = os.path.getsize(target_path) / 1e9
         pbar.set_postfix_str(f"target ({tgt_size:.1f} GB)")
         tgt_raw = np.load(target_path, mmap_mode="r")
+        if target_slices:
+            tgt_raw = np.array(_apply_slices(np.asarray(tgt_raw), target_slices))
         pbar.update(1)
 
         pbar.set_postfix_str("computing...")
