@@ -2,6 +2,7 @@ import os
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -87,3 +88,116 @@ class CombinedLoss(nn.Module):
         for loss_fn, weight in zip(self.losses, self.weights):
             total += weight * loss_fn(inputs, targets)
         return total
+
+
+# ---------------------------------------------------------------------------
+# Loss functions for SR / regression tasks
+# ---------------------------------------------------------------------------
+
+class CharbonnierLoss(nn.Module):
+    """Charbonnier loss: sqrt(x^2 + epsilon^2).
+
+    Differentiable L1 with smooth gradient near zero. Standard in image SR.
+    """
+
+    def __init__(self, epsilon: float = 1e-3):
+        super().__init__()
+        self.epsilon2 = epsilon ** 2
+
+    def forward(self, inputs, targets) -> torch.Tensor:
+        diff = inputs - targets
+        return torch.mean(torch.sqrt(diff * diff + self.epsilon2))
+
+
+class GradientLoss(nn.Module):
+    """L1 on spatial gradients (DH, DW, and DT differences).
+
+    Penalizes edge misalignment — sharpens boundaries (coastlines, fronts).
+    """
+
+    def forward(self, inputs, targets) -> torch.Tensor:
+        total = 0.0
+        for dim in (-3, -2, -1):
+            in_diff = inputs.diff(dim=dim)
+            tgt_diff = targets.diff(dim=dim)
+            total = total + F.l1_loss(in_diff, tgt_diff)
+        return total / 3.0
+
+
+class CoastWeightedLoss(nn.Module):
+    """Charbonnier weighted by proximity to land (target == 0).
+
+    Pixels where target is 0 are land; their neighbors get higher weight
+    to emphasize coastal accuracy. Default weight 3.0 for coastal pixels.
+    """
+
+    def __init__(self, coastal_weight: float = 3.0, epsilon: float = 1e-3):
+        super().__init__()
+        self.coastal_weight = coastal_weight
+        self.epsilon2 = epsilon ** 2
+
+    def forward(self, inputs, targets) -> torch.Tensor:
+        diff = inputs - targets
+        base = torch.sqrt(diff * diff + self.epsilon2)
+
+        land = (targets == 0).float()
+        ocean = 1.0 - land
+        # Coastal = ocean pixel within 1 pixel of land (max-pool of land mask)
+        # Pad to keep spatial dims, pool with kernel 3 to capture 1-ring neighbors.
+        land_padded = F.pad(land, (1, 1, 1, 1, 1, 1))
+        coastal_zone = F.max_pool3d(land_padded, kernel_size=3, stride=1)
+        coastal_zone = (coastal_zone - land).clamp(0, 1)  # coastal only, exclude land
+        weight = 1.0 + (self.coastal_weight - 1.0) * coastal_zone * ocean
+        return torch.mean(base * weight)
+
+
+# ---------------------------------------------------------------------------
+# Loss factory
+# ---------------------------------------------------------------------------
+
+def build_criterion(spec: str) -> nn.Module:
+    """Build a loss function from a short spec string.
+
+    Examples:
+        "mse"                       -> F.mse_loss wrapped
+        "l1"                        -> F.l1_loss wrapped
+        "charbonnier"               -> CharbonnierLoss
+        "charbonnier+gradient"      -> CombinedLoss(charb + grad, weights [1, 0.1])
+        "charbonnier+coast"         -> CombinedLoss(charb + coast, weights [1, 1])
+    """
+    spec = spec.strip().lower()
+    parts = spec.split("+")
+
+    registry = {
+        "mse": lambda: _FunctionalLoss(F.mse_loss),
+        "l1": lambda: _FunctionalLoss(F.l1_loss),
+        "charbonnier": CharbonnierLoss,
+        "charb": CharbonnierLoss,
+        "gradient": GradientLoss,
+        "grad": GradientLoss,
+        "coast": CoastWeightedLoss,
+        "coastal": CoastWeightedLoss,
+    }
+
+    for p in parts:
+        if p not in registry:
+            raise ValueError(f"Unknown loss '{p}'. Available: {list(registry.keys())}")
+
+    losses = [registry[p]() for p in parts]
+    if len(losses) == 1:
+        return losses[0]
+
+    # Default combination weights: anchor loss = 1, others = 0.1
+    weights = [1.0] + [0.1] * (len(losses) - 1)
+    return CombinedLoss(losses, weights)
+
+
+class _FunctionalLoss(nn.Module):
+    """Wrap an arbitrary functional (e.g. F.mse_loss) as an nn.Module."""
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, inputs, targets) -> torch.Tensor:
+        return self.fn(inputs, targets)
